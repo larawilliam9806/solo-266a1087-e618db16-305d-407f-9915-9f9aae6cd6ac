@@ -137,3 +137,24 @@ def transaction(conn: sqlite3.Connection):
         raise
     else:
         conn.execute("COMMIT")
+
+
+@contextmanager
+def read_snapshot(conn: sqlite3.Connection):
+    """Run reads inside one deferred transaction over a single WAL snapshot.
+
+    Unlike :func:`transaction` this never acquires the database write lock, so
+    a long read (for example a review spanning months of messages) does not
+    block backfill uploads, which take ``BEGIN IMMEDIATE`` in their own short
+    transaction.  Every read inside the block sees the same snapshot, fixed at
+    the first read statement; data committed by another connection halfway
+    through the block is invisible until the block ends.
+    """
+    conn.execute("BEGIN")
+    try:
+        yield conn
+    except BaseException:
+        conn.execute("ROLLBACK")
+        raise
+    else:
+        conn.execute("COMMIT")

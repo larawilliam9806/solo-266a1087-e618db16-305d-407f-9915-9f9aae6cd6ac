@@ -185,14 +185,26 @@ def create_app(test_config: dict | None = None) -> Flask:
                     threshold=request.form.get("threshold_cm", ""),
                 )
             )
-        review_id = review_mod.create_review(
-            conn,
-            station=station,
-            period_start=start,
-            period_end=end,
-            threshold_cm=round(threshold, 3),
-            note=(request.form.get("note") or "").strip()[:500],
-        )
+        try:
+            review_id = review_mod.create_review(
+                conn,
+                station=station,
+                period_start=start,
+                period_end=end,
+                threshold_cm=round(threshold, 3),
+                note=(request.form.get("note") or "").strip()[:500],
+            )
+        except review_mod.ReviewError as exc:
+            # Nothing of this review was written; any earlier backfill stays
+            # effective, so the operator can retry the review as-is.
+            flash(str(exc), "error")
+            return redirect(
+                url_for(
+                    "index",
+                    station=station,
+                    threshold=request.form.get("threshold_cm", ""),
+                )
+            )
         return redirect(url_for("review_detail", review_id=review_id))
 
     @app.get("/reviews")

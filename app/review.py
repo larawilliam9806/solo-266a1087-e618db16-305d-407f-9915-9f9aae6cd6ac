@@ -15,8 +15,10 @@ Business rules implemented here (port duty-desk convention):
   brings the effective forecast to/above the line.  A later effective forecast
   below the line cancels it; reaching the line again starts a fresh timer.
 * Lead minutes = crossing hour - start received time.
-* A review is an immutable snapshot: forecasts and observations are copied into
-  ``review_*`` tables inside one write transaction, and results are stored.
+* A review is an immutable snapshot.  Both data reads share one read-only WAL
+  snapshot (no write lock, so concurrent backfills commit immediately), and the
+  snapshot tables plus results are written inside one short write transaction;
+  the review only becomes visible when that transaction commits.
 
 The cutoff for "already received" is the crossing hour itself (inclusive):
 a message stamped as received at exactly the crossing hour yields a lead of 0
@@ -25,6 +27,7 @@ minutes.  Messages received after the crossing hour never influence the result.
 
 from __future__ import annotations
 
+import sqlite3
 from dataclasses import dataclass
 from datetime import datetime, timedelta
 
@@ -32,6 +35,15 @@ from . import db, times
 
 HOUR = timedelta(hours=1)
 _EPOCH = datetime(1970, 1, 1)
+
+
+class ReviewError(RuntimeError):
+    """A review could not be persisted; the data tables stay untouched."""
+
+
+# Test seam: when set, called with the write transaction open and before any
+# review row is inserted.  Always ``None`` outside the test suite.
+_pre_write_hook = None
 
 
 def _seconds_since_epoch(moment: datetime) -> int:
@@ -215,13 +227,27 @@ def create_review(
 ) -> int:
     """Freeze the current data into a review and compute its results.
 
-    Everything — observation reads, forecast reads, snapshot writes and result
-    writes — happens inside one ``BEGIN IMMEDIATE`` transaction, so a later
-    backfill cannot leak into this review.
+    The work is deliberately split into two phases so that a backfill upload
+    never has to wait for a long review:
+
+    1. Read phase — a single deferred read transaction holds one WAL snapshot
+       for both the observation read (which starts crossing detection) and the
+       forecast read.  It takes no write lock, so a concurrent
+       ``BEGIN IMMEDIATE`` upload commits straight away.  Because both reads
+       share that snapshot, a backfill committed between them cannot leak into
+       this review: observations and forecasts always come from the same
+       already-submitted data as of the first read.
+    2. Write phase — one short ``BEGIN IMMEDIATE`` transaction inserts the
+       review row, its snapshot tables and its results together.  The review
+       only becomes visible (list, detail, CSV) after this commits; any failure
+       rolls the whole review back and raises :class:`ReviewError`, leaving
+       data already committed by a backfill in place.
     """
     now_dt = (now or times.utc_now()).replace(microsecond=0)
     created = times.fmt(now_dt)
-    with db.transaction(conn):
+
+    # ---- phase 1: consistent snapshot read, no write lock ------------------
+    with db.read_snapshot(conn):
         obs_rows = conn.execute(
             "SELECT hour_utc, level_cm FROM observation "
             "WHERE station = ? AND hour_utc >= ? AND hour_utc <= ? "
@@ -235,7 +261,7 @@ def create_review(
         # the lookup reads forecast messages for confirmed crossing hours only.
         crossing_hours = [row[0] for row in crossings if row[1] == "crossing"]
 
-        messages: list[Message] = []
+        forecast_rows: list[dict] = []
         if crossing_hours:
             placeholders = ",".join("?" for _ in crossing_hours)
             forecast_rows = conn.execute(
@@ -244,76 +270,94 @@ def create_review(
                 "ORDER BY target_utc, issued_utc, received_utc",
                 [station, *crossing_hours],
             ).fetchall()
-            messages = [Message(**row) for row in forecast_rows]
 
-        results = compute_results(crossings, messages, threshold_cm)
+    # ---- pure computation, no database lock held ---------------------------
+    messages = [Message(**row) for row in forecast_rows]
+    results = compute_results(crossings, messages, threshold_cm)
 
-        cur = conn.execute(
-            "INSERT INTO reviews (station, period_start_utc, period_end_utc, threshold_cm, "
-            "note, created_utc, forecast_count, observation_count) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
-            (
-                station,
-                times.fmt(period_start),
-                times.fmt(period_end),
-                threshold_cm,
-                note,
-                created,
-                len(messages),
-                len(obs_rows),
-            ),
-        )
-        review_id = cur.lastrowid
+    # ---- phase 2: persist snapshot and results atomically ------------------
+    try:
+        with db.transaction(conn):
+            if _pre_write_hook is not None:
+                # Test seam: runs with the write transaction open, before any
+                # review row is inserted.
+                _pre_write_hook(conn)
+            cur = conn.execute(
+                "INSERT INTO reviews (station, period_start_utc, period_end_utc, threshold_cm, "
+                "note, created_utc, forecast_count, observation_count) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                (
+                    station,
+                    times.fmt(period_start),
+                    times.fmt(period_end),
+                    threshold_cm,
+                    note,
+                    created,
+                    len(messages),
+                    len(obs_rows),
+                ),
+            )
+            review_id = cur.lastrowid
 
-        # Snapshot only what the review may read: observations of the window
-        # (plus the previous hour for each first hour) and forecast messages
-        # whose target is one of the crossing hours.
-        for row in obs_rows:
-            conn.execute(
+            # Snapshot only what the review may read: observations of the window
+            # (plus the previous hour for the first hour) and forecast messages
+            # whose target is one of the crossing hours.
+            conn.executemany(
                 "INSERT INTO review_observations (review_id, hour_utc, level_cm) "
                 "VALUES (?, ?, ?)",
-                (review_id, row["hour_utc"], row["level_cm"]),
+                [
+                    (review_id, row["hour_utc"], row["level_cm"])
+                    for row in obs_rows
+                ],
             )
-        for message in messages:
-            conn.execute(
+            conn.executemany(
                 "INSERT INTO review_forecasts "
                 "(review_id, target_utc, issued_utc, received_utc, level_cm) "
                 "VALUES (?, ?, ?, ?, ?)",
-                (
-                    review_id,
-                    message.target_utc,
-                    message.issued_utc,
-                    message.received_utc,
-                    message.level_cm,
-                ),
+                [
+                    (
+                        review_id,
+                        message.target_utc,
+                        message.issued_utc,
+                        message.received_utc,
+                        message.level_cm,
+                    )
+                    for message in messages
+                ],
             )
-        for item in results:
-            conn.execute(
+            conn.executemany(
                 "INSERT INTO review_results ("
                 "review_id, hour_utc, status, obs_level_cm, prev_hour_utc, prev_level_cm, "
                 "warning_valid, start_received_utc, start_issued_utc, lead_minutes, "
                 "authority_level_cm, authority_issued_utc, authority_received_utc, reason, "
                 "messages_by_cutoff, messages_late) "
                 "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-                (
-                    review_id,
-                    item.hour_utc,
-                    item.status,
-                    item.obs_level_cm,
-                    item.prev_hour_utc,
-                    item.prev_level_cm,
-                    1 if item.warning_valid else 0,
-                    item.start_received_utc,
-                    item.start_issued_utc,
-                    item.lead_minutes,
-                    item.authority_level_cm,
-                    item.authority_issued_utc,
-                    item.authority_received_utc,
-                    item.reason,
-                    item.messages_by_cutoff,
-                    item.messages_late,
-                ),
+                [
+                    (
+                        review_id,
+                        item.hour_utc,
+                        item.status,
+                        item.obs_level_cm,
+                        item.prev_hour_utc,
+                        item.prev_level_cm,
+                        1 if item.warning_valid else 0,
+                        item.start_received_utc,
+                        item.start_issued_utc,
+                        item.lead_minutes,
+                        item.authority_level_cm,
+                        item.authority_issued_utc,
+                        item.authority_received_utc,
+                        item.reason,
+                        item.messages_by_cutoff,
+                        item.messages_late,
+                    )
+                    for item in results
+                ],
             )
+    except sqlite3.Error as exc:
+        # The write transaction has already rolled back: nothing of this review
+        # is visible, while any backfill committed earlier stays committed.
+        raise ReviewError(f"回查结果保存失败（数据库未写入本次回查）：{exc}") from exc
     return review_id
 
 
